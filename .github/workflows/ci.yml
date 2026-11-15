@@ -1,0 +1,140 @@
+# Copyright 2026 Maxim Pavlov
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name: Driver CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  license:
+    name: License
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.26.0'
+          cache: false
+      - name: Install pinned addlicense
+        run: go install github.com/google/addlicense@v1.2.0
+      - name: Verify canonical license text
+        run: echo 'cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30  LICENSE' | sha256sum --check
+      - name: Check Apache license headers
+        run: >-
+          addlicense -check -l apache -s -c "Maxim Pavlov" -y 2026
+          -ignore "build/**" -ignore "**/_deps/**"
+          -ignore "**/__pycache__/**" .
+
+  native:
+    name: Native tests (${{ matrix.compiler }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Configure native tests
+        env:
+          CC: ${{ matrix.compiler }}
+        run: >-
+          cmake -S . -B build/native -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug -DPIC16_RGB_BUILD_TESTS=ON
+      - name: Build native tests
+        run: cmake --build build/native --parallel 2
+      - name: Run native tests
+        run: ctest --test-dir build/native --output-on-failure --parallel 2
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: native-${{ matrix.compiler }}
+          path: build/native/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  xc8:
+    name: XC8 (O${{ matrix.optimization }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        optimization: ['0', '2']
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install compiler runtime prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libc6-i386 lib32stdc++6
+      - name: Cache pinned Microchip toolchain
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/pic16-rgb-toolchain
+          key: xc8-linux-x64-${{ hashFiles('.github/scripts/setup-xc8.sh') }}
+      - name: Set up XC8 and device pack
+        run: bash .github/scripts/setup-xc8.sh "$RUNNER_TEMP/pic16-rgb-toolchain"
+      - name: Build examples and verify emitted waveforms
+        env:
+          DEVICE: 16F1454
+          OPTIMIZATION: ${{ matrix.optimization }}
+        run: |
+          mkdir -p build
+          {
+            python3 tools/build_example.py --device "$DEVICE" --optimization "$OPTIMIZATION"
+            python3 tests/python/test_waveform.py "build/${DEVICE}-O${OPTIMIZATION}/example.hex"
+            python3 tools/build_example.py --device "$DEVICE" --optimization "$OPTIMIZATION" --all-pins
+            python3 tests/python/test_waveform.py "build/${DEVICE}-O${OPTIMIZATION}/all-pins/example.hex"
+          } 2>&1 | tee build/xc8-validation.log
+      - name: Upload compiler outputs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: xc8-O${{ matrix.optimization }}
+          path: |
+            build/**/example.hex
+            build/**/example.elf
+            build/**/example.map
+            build/xc8-validation.log
+          if-no-files-found: ignore
+          retention-days: 14
